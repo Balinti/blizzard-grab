@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Blizzard Grab - Free HTML5 Game</title>
+  <meta name="description" content="Play Blizzard Grab - Tap to scoop snowflakes while your penguin's movement flips unpredictably mid-run.">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0a1628">
+  <meta property="og:title" content="Blizzard Grab - Free HTML5 Game">
+  <meta property="og:description" content="Tap to flip your penguin between UPRIGHT and BELLY SLIDE. Dodge ice overhangs and ground spikes. How far can you go?">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://balinti.github.io/blizzard-grab/">
+  <meta property="og:image" content="https://balinti.github.io/blizzard-grab/preview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Blizzard Grab">
+  <meta name="twitter:description" content="Flip your penguin to dodge glacier hazards. Clutch timing = combos!">
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4099346100621490" crossorigin="anonymous"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #050d1a;
+      display: flex; align-items: center; justify-content: center;
+      overflow: hidden;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      touch-action: none;
+    }
+    #wrap {
+      position: relative;
+      width: min(420px, 100vw);
+      height: min(750px, 100vh);
+    }
+    canvas {
+      display: block;
+      width: 100%; height: 100%;
+      border-radius: 12px;
+      box-shadow: 0 0 60px rgba(80,200,255,0.2);
+    }
+  </style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+(function(){
+'use strict';
+
+// ─── Canvas setup ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 420, H = 750;
+const DPR = window.devicePixelRatio || 1;
+canvas.width  = W * DPR;
+canvas.height = H * DPR;
+ctx.scale(DPR, DPR);
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+const GROUND_Y   = 610;
+const CEIL_Y     = 90;
+const PEN_X      = 120;
+const CLUTCH_WINDOW = 0.25; // seconds
+const BEST_KEY   = 'blizzardFlip_best';
+
+// ─── Audio ──────────────────────────────────────────────────────────────────
+let audioCtx = null;
+let muted = false;
+
+function getAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function playTone(freq, type, duration, gainVal, freqEnd) {
+  if (muted) return;
+  try {
+    const ac = getAudio();
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.connect(gain); gain.connect(ac.destination);
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ac.currentTime);
+    if (freqEnd !== undefined) osc.frequency.exponentialRampToValueAtTime(freqEnd, ac.currentTime + duration);
+    gain.gain.setValueAtTime(gainVal, ac.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + duration);
+    osc.start(ac.currentTime);
+    osc.stop(ac.currentTime + duration);
+  } catch(e){}
+}
+
+function sfxFlip()   { playTone(200, 'sine', 0.08, 0.3, 400); }
+function sfxClutch() {
+  [800, 1200, 1600].forEach(f => playTone(f, 'triangle', 0.3, 0.15));
+}
+function sfxDeath()  { playTone(300, 'sawtooth', 0.5, 0.4, 80); }
+
+// ─── State ──────────────────────────────────────────────────────────────────
+let state = 'start'; // 'start' | 'playing' | 'gameover'
+let score = 0;
+let best  = parseInt(localStorage.getItem(BEST_KEY)) || 0;
+let multiplier = 1;
+let speed = 220;
+let hazardCount = 0;
+let lastSpawnX = W + 200;
+
+// Penguin
+let upright = true;       // true = UPRIGHT, false = BELLY
+let flipProgress = 1;     // 0→1 lerp during flip animation
+let clutchActive = false;
+let clutchTimer  = 0;
+
+// Shake
+let shakeX = 0, shakeY = 0, shakeMag = 0, shakeDur = 0, shakeTimer = 0;
+
+// Hue cycle
+let hue = 200;
+
+// Snowflakes
+let flakes = [];
+for (let i = 0; i < 35; i++) {
+  flakes.push({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    r: 1 + Math.random() * 2.5,
+    sp: 0.3 + Math.random() * 0.7,
+    dx: -0.4 - Math.random() * 0.6,
+    a: 0.3 + Math.random() * 0.6
+  });
+}
+
+// Hazards
+let hazards = [];
+
+// Particles
+let particles = [];
+
+// Ice wall parallax layers
+let walls = [
+  { x: 0, speed: 0.2, color: 'rgba(100,180,255,0.06)' },
+  { x: 180, speed: 0.4, color: 'rgba(100,200,255,0.04)' },
+  { x: 90,  speed: 0.6, color: 'rgba(140,220,255,0.03)' }
+];
+
+// Scores displayed during game-over
+let goScore = 0;
+let goAlpha = 0;
+let goTimer = 0;
+
+// ─── Penguin bounding boxes ──────────────────────────────────────────────────
+// UPRIGHT: x=PEN_X-15, y=ground-80, w=30, h=80
+// BELLY:   x=PEN_X-35, y=ground-28, w=70, h=28
+function getPenBox() {
+  if (upright) return { x: PEN_X-15, y: GROUND_Y-80, w: 30, h: 80 };
+  return { x: PEN_X-35, y: GROUND_Y-28, w: 70, h: 28 };
+}
+
+// ─── Hazard patterns ─────────────────────────────────────────────────────────
+// Each pattern is an array of {type:'spike'|'overhang', gap?:bool}
+// gap = true means extra space before this hazard
+const PATTERNS_EASY = [
+  [{type:'spike'}],
+  [{type:'overhang'}],
+  [{type:'spike'}, {type:'spike', gap:true}],
+  [{type:'overhang'}, {type:'overhang', gap:true}],
+  [{type:'spike'}, {type:'overhang', gap:true}],
+  [{type:'overhang'}, {type:'spike', gap:true}],
+];
+const PATTERNS_MED = [
+  [{type:'spike'}, {type:'spike'}],
+  [{type:'overhang'}, {type:'overhang'}],
+  [{type:'overhang'}, {type:'spike'}],
+  [{type:'spike'}, {type:'overhang'}],
+  [{type:'spike'}, {type:'overhang'}, {type:'spike', gap:true}],
+];
+const PATTERNS_HARD = [
+  [{type:'spike'}, {type:'overhang'}, {type:'spike'}],
+  [{type:'overhang'}, {type:'spike'}, {type:'overhang'}],
+  [{type:'spike'}, {type:'spike'}, {type:'overhang', gap:true}],
+  [{type:'overhang'}, {type:'overhang'}, {type:'spike', gap:true}],
+  [{type:'spike'}, {type:'overhang'}, {type:'overhang'}],
+];
+
+let pendingHazards = [];
+let pendingTimer = 0;
+
+function spawnPattern() {
+  let pool;
+  if (score >= 60)      pool = PATTERNS_HARD;
+  else if (score >= 20) pool = PATTERNS_MED;
+  else                  pool = PATTERNS_EASY;
+  const pat = pool[Math.floor(Math.random() * pool.length)];
+  pendingHazards = pat.slice();
+}
+
+function createHazard(type) {
+  const h = { type, x: W + 60, cleared: false, clutchZone: false };
+  if (type === 'spike') {
+    h.baseY = GROUND_Y;
+    h.height = 40 + Math.random() * 40;
+    h.count  = (score >= 20 && Math.random() < 0.4) ? 2 : 1;
+    h.width  = 28 + h.count * 14;
+  } else {
+    // overhang
+    h.topY   = CEIL_Y;
+    h.bottom = CEIL_Y + 40 + Math.random() * 50;
+    h.width  = 50 + Math.random() * 30;
+  }
+  return h;
+}
+
+// ─── Collision detection ─────────────────────────────────────────────────────
+function hazardHitsLethalZone(hz) {
+  const pb = getPenBox();
+  // Horizontal overlap
+  const hzLeft  = hz.x - hz.width / 2;
+  const hzRight = hz.x + hz.width / 2;
+  if (hzRight < pb.x || hzLeft > pb.x + pb.w) return false;
+
+  if (hz.type === 'spike') {
+    // Lethal when UPRIGHT (bottom 50px of penguin box)
+    if (!upright) return false; // BELLY is safe
+    const spikeTop = hz.baseY - hz.height;
+    const penBottom = pb.y + pb.h;
+    const penDangerTop = penBottom - 50;
+    return spikeTop < penBottom && penDangerTop < hz.baseY;
+  } else {
+    // overhang: lethal when UPRIGHT (top 50px)
+    if (!upright) return false; // BELLY is safe
+    const penTop = pb.y;
+    const penDangerBot = penTop + 50;
+    return hz.bottom > penTop && penDangerBot > hz.topY;
+  }
+}
+
+function hazardCleared(hz) {
+  const hzRight = hz.x + hz.width / 2;
+  return hzRight < PEN_X - 15;
+}
+
+// ─── Particles ───────────────────────────────────────────────────────────────
+function spawnClutchParticles(x, y) {
+  for (let i = 0; i < 12; i++) {
+    const angle = (Math.PI * 2 / 12) * i;
+    particles.push({
+      kind: 'crystal',
+      x, y,
+      vx: Math.cos(angle) * (2 + Math.random() * 4),
+      vy: Math.sin(angle) * (2 + Math.random() * 4),
+      life: 1, maxLife: 0.6,
+      r: 3 + Math.random() * 3,
+      color: Math.random() < 0.5 ? '#a0f0ff' : '#ffffff',
+      rot: Math.random() * Math.PI * 2,
+      rotSpd: (Math.random() - 0.5) * 0.3
+    });
+  }
+}
+
+function spawnDeathParticles() {
+  for (let i = 0; i < 20; i++) {
+    particles.push({
+      kind: 'feather',
+      x: PEN_X + (Math.random() - 0.5) * 40,
+      y: GROUND_Y - 40 - Math.random() * 40,
+      vx: (Math.random() - 0.5) * 5,
+      vy: -3 - Math.random() * 4,
+      life: 1, maxLife: 1.0,
+      r: 3 + Math.random() * 4,
+      color: Math.random() < 0.5 ? '#ffffff' : '#ccddee'
+    });
+  }
+}
+
+// ─── Shake ───────────────────────────────────────────────────────────────────
+function triggerShake(mag, dur) {
+  shakeMag = mag; shakeDur = dur; shakeTimer = dur;
+}
+
+// ─── Flip ────────────────────────────────────────────────────────────────────
+function doFlip() {
+  if (state !== 'playing') return;
+  sfxFlip();
+  upright = !upright;
+  flipProgress = 0;
+}
+
+// ─── Input ───────────────────────────────────────────────────────────────────
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  handleInput();
+});
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault();
+    handleInput();
+  }
+});
+
+function handleInput() {
+  if (state === 'start') {
+    startGame();
+  } else if (state === 'playing') {
+    doFlip();
+  } else if (state === 'gameover') {
+    if (goTimer > 0.5) startGame();
+  }
+}
+
+// Speaker icon bounds (logical px)
+const speakerBtn = { x: W-55, y: 12, w: 40, h: 40 };
+canvas.addEventListener('pointerdown', e => {
+  const rect = canvas.getBoundingClientRect();
+  const lx = (e.clientX - rect.left) * (W / rect.width);
+  const ly = (e.clientY - rect.top)  * (H / rect.height);
+  if (lx >= speakerBtn.x && lx <= speakerBtn.x + speakerBtn.w &&
+      ly >= speakerBtn.y && ly <= speakerBtn.y + speakerBtn.h) {
+    muted = !muted;
+    // Don't propagate to flip
+    return;
+  }
+}, { capture: true });
+
+// ─── Game init ───────────────────────────────────────────────────────────────
+function startGame() {
+  state = 'playing';
+  score = 0;
+  multiplier = 1;
+  speed = 220;
+  hazardCount = 0;
+  hazards = [];
+  particles = [];
+  pendingHazards = [];
+  pendingTimer = 0;
+  upright = true;
+  flipProgress = 1;
+  clutchActive = false;
+  clutchTimer = 0;
+  shakeTimer = 0;
+  goTimer = 0;
+  // Initial spawn delay
+  pendingTimer = 1.5;
+  spawnPattern();
+}
+
+// ─── Main game update ─────────────────────────────────────────────────────────
+let last = 0;
+function update(dt) {
+  hue = (hue + dt * 5) % 360;
+
+  // Flip animation lerp
+  if (flipProgress < 1) {
+    flipProgress = Math.min(1, flipProgress + dt * 12);
+  }
+
+  // Clutch strobe
+  if (clutchActive) {
+    clutchTimer -= dt;
+    if (clutchTimer <= 0) clutchActive = false;
+  }
+
+  // Snowflakes
+  for (const f of flakes) {
+    f.x += f.dx * (speed / 220) * 0.5;
+    f.y += f.sp;
+    if (f.y > H + 5) { f.y = -5; f.x = Math.random() * W; }
+    if (f.x < -5)    { f.x = W + 5; f.y = Math.random() * H; }
+  }
+
+  // Parallax walls
+  for (const w of walls) {
+    w.x -= speed * w.speed * dt;
+    if (w.x < -W) w.x += W * 2;
+  }
+
+  // Shake
+  if (shakeTimer > 0) {
+    shakeTimer -= dt;
+    const frac = shakeTimer / shakeDur;
+    const mag = shakeMag * frac;
+    shakeX = (Math.random() - 0.5) * mag * 2;
+    shakeY = (Math.random() - 0.5) * mag * 2;
+  } else { shakeX = 0; shakeY = 0; }
+
+  // Spawn hazards
+  if (pendingHazards.length > 0) {
+    pendingTimer -= dt;
+    if (pendingTimer <= 0) {
+      const next = pendingHazards.shift();
+      const gap = next.gap ? 0.4 : 0;
+      const hz = createHazard(next.type);
+      hazards.push(hz);
+      const minGap = (1.2 * speed) / speed;
+      pendingTimer = minGap + gap + (0.3 + Math.random() * 0.3);
+    }
+  } else {
+    pendingTimer -= dt;
+    if (pendingTimer <= 0) {
+      spawnPattern();
+      pendingTimer = 0;
+    }
+  }
+
+  // Move hazards
+  for (const hz of hazards) {
+    hz.x -= speed * dt;
+
+    // Clutch window detection
+    const pb = getPenBox();
+    const hzLeft  = hz.x - hz.width / 2;
+    const hzRight = hz.x + hz.width / 2;
+    const penMid  = PEN_X;
+    const inWindow = Math.abs(hzLeft - penMid) < (speed * CLUTCH_WINDOW) ||
+                     (hzLeft < penMid + 20 && hzRight > penMid - 20);
+    hz.clutchZone = inWindow;
+  }
+
+  // Collision & clearing
+  const toRemove = [];
+  for (const hz of hazards) {
+    if (hazardHitsLethalZone(hz)) {
+      // DEAD
+      sfxDeath();
+      triggerShake(18, 0.6);
+      spawnDeathParticles();
+      goScore = score;
+      if (score > best) {
+        best = score;
+        localStorage.setItem(BEST_KEY, best);
+      }
+      state = 'gameover';
+      goAlpha = 0;
+      goTimer = 0;
+      return;
+    }
+
+    if (!hz.cleared && hazardCleared(hz)) {
+      hz.cleared = true;
+      // Was this a clutch?
+      if (hz.clutchZone) {
+        sfxClutch();
+        multiplier = Math.min(4, multiplier + 1);
+        clutchActive = true;
+        clutchTimer = 0.4;
+        spawnClutchParticles(PEN_X, GROUND_Y - 50);
+      } else {
+        multiplier = Math.max(1, multiplier - 1 === 0 ? 1 : multiplier);
+      }
+      score += multiplier;
+      hazardCount++;
+      // Speed up
+      if (hazardCount % 10 === 0) speed = Math.min(480, speed + 15);
+    }
+
+    if (hz.x < -120) toRemove.push(hz);
+  }
+  hazards = hazards.filter(h => !toRemove.includes(h));
+
+  // Particles
+  for (const p of particles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += (p.kind === 'feather') ? 0.1 : 0;
+    p.life -= dt / p.maxLife;
+    if (p.rot !== undefined) p.rot += p.rotSpd;
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+// ─── Drawing ──────────────────────────────────────────────────────────────────
+function drawBg() {
+  // Sky gradient
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0,   '#0a1628');
+  sky.addColorStop(0.55,'#0e2244');
+  sky.addColorStop(0.8, '#1a3a5c');
+  sky.addColorStop(1,   '#c8e8f8');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // Aurora-ish streaks
+  ctx.save();
+  ctx.globalAlpha = 0.06;
+  for (let i = 0; i < 3; i++) {
+    const gr = ctx.createLinearGradient(0, 50 + i*80, W, 150 + i*80);
+    gr.addColorStop(0, 'transparent');
+    gr.addColorStop(0.5, `hsl(${hue + i*40},80%,70%)`);
+    gr.addColorStop(1, 'transparent');
+    ctx.fillStyle = gr;
+    ctx.fillRect(0, 50 + i*80, W, 60);
+  }
+  ctx.restore();
+
+  // Parallax ice walls (vertical streaks)
+  for (const w of walls) {
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = w.color;
+    // Draw vertical bars
+    for (let bx = (w.x % 80) - 80; bx < W + 80; bx += 80) {
+      ctx.fillRect(bx, CEIL_Y, 20, GROUND_Y - CEIL_Y);
+    }
+    ctx.restore();
+  }
+
+  // Snowflakes
+  ctx.save();
+  for (const f of flakes) {
+    ctx.globalAlpha = f.a * 0.7;
+    ctx.fillStyle = '#d0eeff';
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Ground
+  const gr2 = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+  gr2.addColorStop(0, '#d4efff');
+  gr2.addColorStop(0.1, '#a8d8f0');
+  gr2.addColorStop(1, '#5599cc');
+  ctx.fillStyle = gr2;
+  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+
+  // Ground top shine
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillRect(0, GROUND_Y, W, 3);
+
+  // Ceiling ice
+  const cg = ctx.createLinearGradient(0, 0, 0, CEIL_Y);
+  cg.addColorStop(0, '#4a8ab5');
+  cg.addColorStop(1, '#88c4e8');
+  ctx.fillStyle = cg;
+  ctx.fillRect(0, 0, W, CEIL_Y);
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillRect(0, CEIL_Y - 2, W, 3);
+
+  // Ice stalactites (decorative, non-lethal)
+  ctx.save();
+  for (let sx = 30; sx < W; sx += 55 + Math.sin(sx * 0.1) * 10) {
+    const sh = 10 + Math.sin(sx * 0.07 + hue * 0.01) * 8;
+    ctx.fillStyle = 'rgba(180,230,255,0.25)';
+    ctx.beginPath();
+    ctx.moveTo(sx - 8, CEIL_Y);
+    ctx.lineTo(sx + 8, CEIL_Y);
+    ctx.lineTo(sx, CEIL_Y + sh);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawHazard(hz) {
+  ctx.save();
+  if (hz.type === 'spike') {
+    const glow = ctx.createRadialGradient(hz.x, hz.baseY, 0, hz.x, hz.baseY, 80);
+    glow.addColorStop(0, 'rgba(255,140,0,0.3)');
+    glow.addColorStop(1, 'rgba(255,80,0,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(hz.x - 80, hz.baseY - 80, 160, 80);
+
+    const count = hz.count || 1;
+    for (let i = 0; i < count; i++) {
+      const ox = hz.x + (i - (count-1)/2) * 22;
+      const h  = hz.height + (i % 2 === 0 ? 0 : -12);
+      ctx.beginPath();
+      ctx.moveTo(ox - 12, hz.baseY);
+      ctx.lineTo(ox + 12, hz.baseY);
+      ctx.lineTo(ox, hz.baseY - h);
+      ctx.closePath();
+      const sg = ctx.createLinearGradient(ox, hz.baseY, ox, hz.baseY - h);
+      sg.addColorStop(0, '#ff6600');
+      sg.addColorStop(1, '#ffdd00');
+      ctx.fillStyle = sg;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,200,100,0.8)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  } else {
+    // Overhang
+    const glow = ctx.createRadialGradient(hz.x, hz.topY, 0, hz.x, hz.bottom, 60);
+    glow.addColorStop(0, 'rgba(60,160,255,0.35)');
+    glow.addColorStop(1, 'rgba(0,80,200,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(hz.x - hz.width/2 - 20, hz.topY, hz.width + 40, hz.bottom - hz.topY + 20);
+
+    const og = ctx.createLinearGradient(hz.x, hz.topY, hz.x, hz.bottom);
+    og.addColorStop(0, '#1a5faa');
+    og.addColorStop(1, '#80ccff');
+    ctx.fillStyle = og;
+    ctx.fillRect(hz.x - hz.width/2, hz.topY, hz.width, hz.bottom - hz.topY);
+
+    // Icicle tips
+    const ic = hz.bottom;
+    ctx.beginPath();
+    ctx.moveTo(hz.x - hz.width/2 + 4, ic);
+    ctx.lineTo(hz.x - hz.width/2 + 14, ic);
+    ctx.lineTo(hz.x - hz.width/2 + 9, ic + 14);
+    ctx.closePath();
+    ctx.fillStyle = '#b8e8ff';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(hz.x - 5, ic);
+    ctx.lineTo(hz.x + 5, ic);
+    ctx.lineTo(hz.x, ic + 18);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(hz.x + hz.width/2 - 14, ic);
+    ctx.lineTo(hz.x + hz.width/2 - 4, ic);
+    ctx.lineTo(hz.x + hz.width/2 - 9, ic + 12);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(160,220,255,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(hz.x - hz.width/2, hz.topY, hz.width, hz.bottom - hz.topY);
+  }
+  ctx.restore();
+}
+
+function drawPenguin() {
+  const t = flipProgress; // 0→1
+  const squeeze = upright
+    ? (1 - Math.sin(Math.PI * (1-t)) * 0.5)
+    : (1 - Math.sin(Math.PI * (1-t)) * 0.5);
+
+  ctx.save();
+
+  // Clutch strobe
+  if (clutchActive) {
+    const pulse = Math.sin(clutchTimer * 30) * 0.5 + 0.5;
+    ctx.shadowColor = '#a0f0ff';
+    ctx.shadowBlur  = 20 * pulse;
+  }
+
+  if (upright) {
+    const bw = 30 * (2 - squeeze);
+    const bh = 80 * squeeze;
+    const bx = PEN_X - bw/2;
+    const by = GROUND_Y - bh;
+
+    // Body
+    ctx.fillStyle = '#1a1a2e';
+    roundRect(ctx, bx, by, bw, bh, 10);
+    ctx.fill();
+
+    // White belly
+    ctx.fillStyle = '#e8f4ff';
+    ctx.beginPath();
+    ctx.ellipse(PEN_X, by + bh*0.55, bw*0.3, bh*0.35, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Head
+    ctx.fillStyle = '#1a1a2e';
+    ctx.beginPath();
+    ctx.arc(PEN_X, by - 12 * squeeze, 16 * (2 - squeeze) * 0.5, 0, Math.PI*2);
+    ctx.fill();
+
+    // White face
+    ctx.fillStyle = '#e8f4ff';
+    ctx.beginPath();
+    ctx.ellipse(PEN_X + 3, by - 12 * squeeze, 9, 7, 0.3, 0, Math.PI*2);
+    ctx.fill();
+
+    // Eye
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc(PEN_X + 6, by - 14 * squeeze, 2.5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(PEN_X + 7, by - 15 * squeeze, 1, 0, Math.PI*2);
+    ctx.fill();
+
+    // Beak
+    ctx.fillStyle = '#ff9900';
+    ctx.beginPath();
+    ctx.moveTo(PEN_X + 14, by - 11 * squeeze);
+    ctx.lineTo(PEN_X + 22, by - 13 * squeeze);
+    ctx.lineTo(PEN_X + 14, by - 8 * squeeze);
+    ctx.closePath();
+    ctx.fill();
+
+    // Feet
+    ctx.fillStyle = '#ff9900';
+    ctx.fillRect(PEN_X - bw/2 - 4, GROUND_Y - 6, 14, 6);
+    ctx.fillRect(PEN_X + 4, GROUND_Y - 6, 14, 6);
+
+    // Wings
+    ctx.fillStyle = '#2a2a40';
+    ctx.beginPath();
+    ctx.ellipse(bx - 4, by + bh*0.4, 6, bh*0.25, -0.3, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(bx + bw + 4, by + bh*0.4, 6, bh*0.25, 0.3, 0, Math.PI*2);
+    ctx.fill();
+
+  } else {
+    // BELLY SLIDE
+    const bw = 70 * squeeze;
+    const bh = 28 * (2 - squeeze);
+    const bx = PEN_X - bw/2;
+    const by = GROUND_Y - bh;
+
+    // Body
+    ctx.fillStyle = '#1a1a2e';
+    roundRect(ctx, bx, by, bw, bh, 8);
+    ctx.fill();
+
+    // Belly stripe
+    ctx.fillStyle = '#e8f4ff';
+    roundRect(ctx, bx + bw*0.15, by + bh*0.15, bw*0.55, bh*0.7, 5);
+    ctx.fill();
+
+    // Head peeking right
+    ctx.fillStyle = '#1a1a2e';
+    ctx.beginPath();
+    ctx.arc(bx + bw + 4, by + bh/2, 13 * squeeze, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = '#e8f4ff';
+    ctx.beginPath();
+    ctx.ellipse(bx + bw + 7, by + bh/2 - 1, 7, 5, 0.2, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc(bx + bw + 10, by + bh/2 - 3, 2, 0, Math.PI*2);
+    ctx.fill();
+
+    // Beak
+    ctx.fillStyle = '#ff9900';
+    ctx.beginPath();
+    ctx.moveTo(bx + bw + 18, by + bh/2);
+    ctx.lineTo(bx + bw + 26, by + bh/2 - 3);
+    ctx.lineTo(bx + bw + 18, by + bh/2 + 4);
+    ctx.closePath();
+    ctx.fill();
+
+    // Speed lines
+    ctx.strokeStyle = 'rgba(180,230,255,0.4)';
+    ctx.lineWidth = 1.5;
+    for (let li = 0; li < 3; li++) {
+      const ly = by + bh * (0.2 + li * 0.3);
+      ctx.beginPath();
+      ctx.moveTo(bx - 10 - li*8, ly);
+      ctx.lineTo(bx - 30 - li*8, ly);
+      ctx.stroke();
+    }
+  }
+
+  // Clutch glow ring
+  if (clutchActive) {
+    const pulse = Math.sin(clutchTimer * 30) * 0.5 + 0.5;
+    ctx.globalAlpha = pulse * 0.6;
+    ctx.strokeStyle = '#a0f0ff';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(PEN_X, GROUND_Y - 40, 35, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p.life) * 0.9;
+    if (p.kind === 'crystal') {
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(-p.r, 0); ctx.lineTo(p.r, 0);
+      ctx.moveTo(0, -p.r); ctx.lineTo(0, p.r);
+      ctx.moveTo(-p.r*0.7, -p.r*0.7); ctx.lineTo(p.r*0.7, p.r*0.7);
+      ctx.moveTo(p.r*0.7, -p.r*0.7); ctx.lineTo(-p.r*0.7, p.r*0.7);
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, p.r, p.r * 0.5, Math.atan2(p.vy, p.vx), 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function drawHUD() {
+  // Score
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 28px system-ui';
+  ctx.shadowColor = 'rgba(0,150,255,0.6)';
+  ctx.shadowBlur = 10;
+  ctx.fillText(score, W/2, 60);
+  ctx.restore();
+
+  // Multiplier badge
+  if (multiplier > 1) {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 14px system-ui';
+    const label = `×${multiplier}`;
+    const tw = ctx.measureText(label).width;
+    const bx = W/2 - tw/2 - 8, by = 66;
+    const bw2 = tw + 16, bh2 = 20;
+    ctx.fillStyle = multiplier >= 4 ? '#ff6600' : '#00aaff';
+    ctx.shadowColor = multiplier >= 4 ? 'rgba(255,100,0,0.8)' : 'rgba(0,160,255,0.8)';
+    ctx.shadowBlur = 12;
+    roundRect(ctx, bx, by, bw2, bh2, 6);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.shadowBlur = 0;
+    ctx.fillText(label, W/2, by + 14);
+    ctx.restore();
+  }
+
+  // State label top-left
+  ctx.save();
+  ctx.font = '13px system-ui';
+  ctx.fillStyle = upright ? '#88ddff' : '#ffcc44';
+  ctx.textAlign = 'left';
+  ctx.fillText(upright ? 'UPRIGHT' : 'BELLY SLIDE', 14, 30);
+  ctx.restore();
+
+  // Speaker icon
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  roundRect(ctx, speakerBtn.x, speakerBtn.y, speakerBtn.w, speakerBtn.h, 8);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = '20px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText(muted ? '🔇' : '🔊', speakerBtn.x + speakerBtn.w/2, speakerBtn.y + 27);
+  ctx.restore();
+}
+
+function drawStartScreen() {
+  // Overlay
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,15,35,0.55)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Title card
+  const cx = W/2, cy = H/2 - 60;
+  ctx.fillStyle = 'rgba(10,25,60,0.85)';
+  roundRect(ctx, cx - 160, cy - 90, 320, 220, 20);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(80,180,255,0.4)';
+  ctx.lineWidth = 1.5;
+  roundRect(ctx, cx - 160, cy - 90, 320, 220, 20);
+  ctx.stroke();
+
+  // Snowflake deco
+  ctx.font = '48px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#a0e8ff';
+  ctx.shadowColor = '#60c0ff';
+  ctx.shadowBlur = 20;
+  ctx.fillText('❄', cx, cy - 40);
+
+  // Title
+  ctx.shadowBlur = 0;
+  ctx.font = 'bold 34px system-ui';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = 'rgba(100,200,255,0.8)';
+  ctx.shadowBlur = 16;
+  ctx.fillText('BLIZZARD', cx, cy + 10);
+  ctx.font = 'bold 30px system-ui';
+  ctx.fillStyle = '#80d8ff';
+  ctx.fillText('FLIP', cx, cy + 45);
+
+  // Subtitle
+  ctx.shadowBlur = 0;
+  ctx.font = '14px system-ui';
+  ctx.fillStyle = 'rgba(180,220,255,0.9)';
+  ctx.fillText('Dodge ice hazards. Clutch the timing.', cx, cy + 80);
+
+  // Tip
+  ctx.font = '13px system-ui';
+  ctx.fillStyle = 'rgba(140,200,255,0.7)';
+  ctx.fillText('🟠 SPIKE = stay BELLY  •  🔵 OVERHANG = stay BELLY', cx, cy + 105);
+
+  // Tap prompt
+  const pulse = Math.sin(Date.now() * 0.004) * 0.3 + 0.7;
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 18px system-ui';
+  ctx.fillStyle = '#a0f0ff';
+  ctx.shadowColor = '#60e0ff';
+  ctx.shadowBlur = 12;
+  ctx.fillText('TAP TO START', cx, H/2 + 120);
+
+  // Best
+  if (best > 0) {
+    ctx.globalAlpha = 0.8;
+    ctx.font = '14px system-ui';
+    ctx.fillStyle = '#ffdd88';
+    ctx.shadowBlur = 0;
+    ctx.fillText(`Best: ${best}`, cx, H/2 + 150);
+  }
+  ctx.restore();
+}
+
+function drawGameOver() {
+  goTimer += 0.016;
+  goAlpha = Math.min(1, goTimer * 2);
+
+  ctx.save();
+  ctx.globalAlpha = goAlpha * 0.6;
+  ctx.fillStyle = 'rgba(5,10,30,1)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.globalAlpha = goAlpha;
+  const cx = W/2, cy = H/2 - 40;
+
+  ctx.fillStyle = 'rgba(10,20,50,0.92)';
+  roundRect(ctx, cx - 150, cy - 100, 300, 260, 18);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,80,80,0.5)';
+  ctx.lineWidth = 2;
+  roundRect(ctx, cx - 150, cy - 100, 300, 260, 18);
+  ctx.stroke();
+
+  ctx.font = '40px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText('🐧', cx, cy - 50);
+
+  ctx.font = 'bold 26px system-ui';
+  ctx.fillStyle = '#ff6666';
+  ctx.shadowColor = 'rgba(255,80,80,0.6)';
+  ctx.shadowBlur = 12;
+  ctx.fillText('WIPED OUT!', cx, cy - 10);
+
+  ctx.shadowBlur = 0;
+  ctx.font = '16px system-ui';
+  ctx.fillStyle = 'rgba(180,220,255,0.8)';
+  ctx.fillText('Score', cx, cy + 30);
+  ctx.font = 'bold 46px system-ui';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = 'rgba(100,200,255,0.6)';
+  ctx.shadowBlur = 10;
+  ctx.fillText(goScore, cx, cy + 78);
+
+  ctx.shadowBlur = 0;
+  ctx.font = '14px system-ui';
+  ctx.fillStyle = goScore >= best ? '#ffdd44' : 'rgba(180,220,255,0.6)';
+  ctx.fillText(goScore >= best ? `🏆 NEW BEST: ${best}` : `Best: ${best}`, cx, cy + 108);
+
+  const pulse = Math.sin(Date.now() * 0.004) * 0.25 + 0.75;
+  ctx.globalAlpha = goAlpha * pulse;
+  ctx.font = 'bold 17px system-ui';
+  ctx.fillStyle = '#a0f0ff';
+  ctx.shadowColor = '#60e0ff';
+  ctx.shadowBlur = 10;
+  ctx.fillText('TAP TO RETRY', cx, cy + 148);
+  ctx.restore();
+}
+
+// ─── Main loop ────────────────────────────────────────────────────────────────
+function loop(ts) {
+  const dt = Math.min((ts - last) / 1000, 0.05);
+  last = ts;
+
+  ctx.save();
+  ctx.translate(shakeX, shakeY);
+
+  drawBg();
+
+  if (state === 'playing') {
+    update(dt);
+    for (const hz of hazards) drawHazard(hz);
+    drawPenguin();
+    drawParticles();
+    drawHUD();
+  } else if (state === 'start') {
+    // Draw static penguin on start screen
+    drawPenguin();
+    drawStartScreen();
+  } else if (state === 'gameover') {
+    drawParticles();
+    // Update particles even on gameover
+    for (const p of particles) {
+      p.x += p.vx; p.y += p.vy;
+      p.vy += 0.08;
+      p.life -= dt / p.maxLife;
+    }
+    particles = particles.filter(p => p.life > 0);
+    drawGameOver();
+  }
+
+  ctx.restore();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(ts => { last = ts; requestAnimationFrame(loop); });
+
+})();
+</script>
+</body>
+</html>
